@@ -10,6 +10,7 @@ import soundfile as sf
 import subprocess
 import shutil
 import numpy as np
+import gc
 
 # --- (TensorFlow import is the same) ---
 try:
@@ -25,7 +26,7 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 
 @app.route('/segment-audio', methods=['POST'])
 def segment_audio():
-    print("--- Segment Audio Request Received (True Streaming Mode) ---")
+    print("--- Segment Audio Request Received (Streaming + Hard Memory Reset Mode) ---")
     original_temp_audio_path = None
     
     try:
@@ -52,19 +53,13 @@ def segment_audio():
         with sf.SoundFile(original_temp_audio_path) as f:
             total_duration_seconds = len(f) / f.samplerate
         
-        # --- New Streaming Logic ---
-        SAMPLE_RATE = 16000  # The rate the model expects
-        CHUNK_DURATION_SECONDS = 60 # Process 1 minute of audio at a time
-        CHUNK_SIZE = CHUNK_DURATION_SECONDS * SAMPLE_RATE * 2 # 2 bytes per sample (16-bit)
+        SAMPLE_RATE = 16000
+        CHUNK_DURATION_SECONDS = 60
+        CHUNK_SIZE = CHUNK_DURATION_SECONDS * SAMPLE_RATE * 2
 
-        # This FFmpeg command reads the input file and pipes out raw audio data
         ffmpeg_command = [
-            'ffmpeg',
-            '-i', original_temp_audio_path,
-            '-f', 's16le',          # Format: signed 16-bit little-endian
-            '-ac', '1',             # Channels: 1 (mono)
-            '-ar', str(SAMPLE_RATE),# Sample rate: 16kHz
-            '-'                     # Output to stdout
+            'ffmpeg', '-i', original_temp_audio_path,
+            '-f', 's16le', '-ac', '1', '-ar', str(SAMPLE_RATE), '-'
         ]
         
         print("Starting FFmpeg streaming process...")
@@ -74,26 +69,26 @@ def segment_audio():
         current_offset = 0.0
 
         while True:
-            # Read a chunk of raw audio data from FFmpeg's output
             raw_audio_chunk = ffmpeg_process.stdout.read(CHUNK_SIZE)
             if not raw_audio_chunk:
-                break # End of stream
+                break
 
-            # Convert the raw bytes to a NumPy array
             audio_array = np.frombuffer(raw_audio_chunk, dtype=np.int16)
 
-            # The segmenter can process a NumPy array directly
             print(f"Processing audio chunk from {current_offset:.2f}s...")
-            chunk_segmentation = seg.segment(audio_array, sr=SAMPLE_RATE)
+            # --- FIX: Corrected the way the segmenter is called with a NumPy array ---
+            chunk_segmentation = seg((audio_array, SAMPLE_RATE))
             
-            # Adjust timestamps and add to master list
             for label, start, end in chunk_segmentation:
                 all_segments.append((label, start + current_offset, end + current_offset))
             
-            # Update the offset for the next chunk
             current_offset += CHUNK_DURATION_SECONDS
 
-        # Wait for FFmpeg to finish and check for errors
+            # Force a hard memory reset after processing each chunk
+            print("Clearing Keras session and running garbage collection...")
+            tf.keras.backend.clear_session()
+            gc.collect()
+
         ffmpeg_process.wait()
         if ffmpeg_process.returncode != 0:
             error_output = ffmpeg_process.stderr.read().decode()
@@ -130,7 +125,6 @@ def segment_audio():
         print(f"An error occurred: {e}")
         return jsonify({"error": f"An error occurred: {e}"}), 500
     finally:
-        # --- (Cleanup logic is the same) ---
         if original_temp_audio_path and os.path.exists(original_temp_audio_path):
             os.remove(original_temp_audio_path)
 
