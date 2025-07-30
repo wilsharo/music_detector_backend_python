@@ -1,11 +1,10 @@
+# requirements.txt
 Flask==2.3.3
 Flask-Cors==4.0.0
 inaSpeechSegmenter==0.7.14
 pydub==0.25.1
 requests==2.31.0
-tensorflow-cpu==2.15.0
+tensorflow==2.15.0  # <-- THIS LINE IS DIFF from CPU VERSION
 numpy==1.23.5
 soundfile==0.12.1
-onnxruntime==1.17.1
-# New dependency for transcription
 openai-whisper==20231117
