@@ -20,7 +20,11 @@ if not ASSEMBLYAI_API_KEY:
 aai.settings.api_key = ASSEMBLYAI_API_KEY
 
 # This function is for the music segmentation subprocess
-def process_music_chunk(chunk_file_path, result_list):
+def process_music_chunk(chunk_file_path, chunk_index, result_list):
+    """
+    Processes a single audio chunk and adds the results, tagged with the
+    chunk's index, to a shared list.
+    """
     try:
         from inaSpeechSegmenter import Segmenter
         from pydub import AudioSegment
@@ -30,7 +34,9 @@ def process_music_chunk(chunk_file_path, result_list):
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as temp_wav:
             processed_chunk.export(temp_wav.name, format="wav")
             chunk_segmentation = seg(temp_wav.name)
-            result_list.extend(chunk_segmentation)
+            # Add the chunk_index to each result tuple
+            for label, start, end in chunk_segmentation:
+                result_list.append((chunk_index, label, start, end))
     except Exception as e:
         print(f"[pid:{os.getpid()}] ERROR in music chunk process: {e}")
 
@@ -67,8 +73,7 @@ def segment_audio():
 
         # --- Step 1: Start AssemblyAI Transcription (asynchronous) ---
         print("Submitting audio source to AssemblyAI for transcription...")
-        # --- FIX: Removed the incorrect speech_threshold parameter ---
-        config = aai.TranscriptionConfig(speaker_labels=True) # disfluencies and speech_gaps are enabled by default
+        config = aai.TranscriptionConfig(speaker_labels=True)
         transcriber = aai.Transcriber()
         transcript_future = transcriber.transcribe_async(audio_source, config)
 
@@ -91,20 +96,23 @@ def segment_audio():
             all_music_segments_raw = manager.list()
             processes = []
             for i, chunk_file_path in enumerate(chunk_files):
-                p = Process(target=process_music_chunk, args=(chunk_file_path, all_music_segments_raw))
+                # Pass the chunk index 'i' to the subprocess
+                p = Process(target=process_music_chunk, args=(chunk_file_path, i, all_music_segments_raw))
                 processes.append(p)
                 p.start()
             for p in processes:
                 p.join()
             
+            # --- FIX: Sort raw results by chunk index before processing ---
+            # This ensures chronological order regardless of process completion time.
+            sorted_segments_raw = sorted(list(all_music_segments_raw), key=lambda x: x[0])
+
             final_music_segments = []
             current_music_block = None
             
-            # This logic assumes chunks are processed in order.
-            for i, (label, start, end) in enumerate(list(all_music_segments_raw)):
-                # A more robust offset calculation is needed if multiprocessing order is not guaranteed.
-                # This simple approach works for sequential processing of chunks.
-                offset = (i // (len(all_music_segments_raw) / len(chunk_files))) * CHUNK_DURATION_SECONDS
+            for chunk_index, label, start, end in sorted_segments_raw:
+                # Calculate the precise offset using the chunk_index
+                offset = chunk_index * CHUNK_DURATION_SECONDS
                 if label == 'music':
                     start, end = start + offset, end + offset
                     if (end - start) >= 3:
@@ -143,7 +151,6 @@ def segment_audio():
             if not is_segment_in_music(round(word.start / 1000, 2), round(word.end / 1000, 2), final_music_segments)
         ]
         
-        # Safely access speech_gaps attribute
         speech_gaps = transcript.speech_gaps if hasattr(transcript, 'speech_gaps') else []
         dead_air_segments = [
             {"start": round(gap.start / 1000, 2), "end": round(gap.end / 1000, 2), "duration": round(gap.duration / 1000, 2)}
@@ -170,7 +177,6 @@ def segment_audio():
         print(f"An error occurred during segmentation: {e}")
         return jsonify({"error": f"An error occurred: {e}"}), 500
     finally:
-        # Only clean up the original temp path if it was created (from a file upload)
         if original_temp_audio_path and os.path.exists(original_temp_audio_path):
             os.remove(original_temp_audio_path)
         if temp_chunk_dir and os.path.exists(temp_chunk_dir):
