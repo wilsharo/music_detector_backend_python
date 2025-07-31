@@ -10,38 +10,15 @@ import subprocess
 import glob
 import shutil
 import json
-from multiprocessing import Process, Manager
+from inaSpeechSegmenter import Segmenter
+from pydub import AudioSegment
 import assemblyai as aai
 
 # --- AssemblyAI API Key ---
-# IMPORTANT: Set this as an environment variable in your deployment
 ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY")
 if not ASSEMBLYAI_API_KEY:
     print("WARNING: ASSEMBLYAI_API_KEY environment variable not set.")
 aai.settings.api_key = ASSEMBLYAI_API_KEY
-
-# This function is for the music segmentation subprocess
-def process_music_chunk(chunk_file_path, chunk_index, result_list):
-    """
-    Processes a single audio chunk in an isolated process and adds the results,
-    tagged with the chunk's index, to a shared list.
-    """
-    try:
-        from inaSpeechSegmenter import Segmenter
-        from pydub import AudioSegment
-        seg = Segmenter()
-        
-        audio_chunk = AudioSegment.from_file(chunk_file_path)
-        processed_chunk = audio_chunk.set_frame_rate(16000).set_channels(1)
-        
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as temp_wav:
-            processed_chunk.export(temp_wav.name, format="wav")
-            chunk_segmentation = seg(temp_wav.name)
-            
-            for label, start, end in chunk_segmentation:
-                result_list.append((chunk_index, label, start, end))
-    except Exception as e:
-        print(f"[pid:{os.getpid()}] ERROR in music chunk process: {e}")
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}) 
@@ -80,7 +57,7 @@ def segment_audio():
         transcriber = aai.Transcriber()
         transcript_future = transcriber.transcribe_async(audio_source, config)
 
-        # --- Step 2: Perform Music Segmentation in Parallel ---
+        # --- Step 2: Perform Music Segmentation Sequentially for Accuracy ---
         print("Starting music segmentation...")
         ffprobe_command = ['ffprobe', '-v', 'error', '-show_format', '-print_format', 'json', audio_source]
         ffprobe_result = subprocess.run(ffprobe_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -95,41 +72,45 @@ def segment_audio():
         
         chunk_files = sorted(glob.glob(os.path.join(temp_chunk_dir, 'chunk_*.wav')))
         
-        with Manager() as manager:
-            all_music_segments_raw = manager.list()
-            processes = []
-            for i, chunk_file_path in enumerate(chunk_files):
-                p = Process(target=process_music_chunk, args=(chunk_file_path, i, all_music_segments_raw))
-                processes.append(p)
-                p.start()
-            for p in processes:
-                p.join()
-            
-            sorted_segments_raw = sorted(list(all_music_segments_raw), key=lambda x: x[0])
+        # --- FIX: Reverted to a reliable sequential loop for music segmentation ---
+        all_segments_with_offsets = []
+        seg_model = Segmenter() # Initialize model once
 
-            final_music_segments = []
-            current_music_block = None
+        for i, chunk_file_path in enumerate(chunk_files):
+            print(f"Processing music chunk {i+1}/{len(chunk_files)}...")
+            audio_chunk = AudioSegment.from_file(chunk_file_path)
+            processed_chunk = audio_chunk.set_frame_rate(16000).set_channels(1)
             
-            for chunk_index, label, start, end in sorted_segments_raw:
-                offset = chunk_index * CHUNK_DURATION_SECONDS
-                if label == 'music':
-                    start, end = start + offset, end + offset
-                    if (end - start) >= 3:
-                        if current_music_block is None:
-                            current_music_block = {'start': start, 'end': end}
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as temp_wav:
+                processed_chunk.export(temp_wav.name, format="wav")
+                chunk_segmentation = seg_model(temp_wav.name)
+                
+                offset = i * CHUNK_DURATION_SECONDS
+                for label, start, end in chunk_segmentation:
+                    all_segments_with_offsets.append((label, start + offset, end + offset))
+
+        # Merge the results after all chunks are processed
+        final_music_segments = []
+        current_music_block = None
+        for label, start, end in all_segments_with_offsets:
+            if label == 'music':
+                if (end - start) >= 3:
+                    if current_music_block is None:
+                        current_music_block = {'start': start, 'end': end}
+                    else:
+                        if start - current_music_block['end'] < 2.0:
+                            current_music_block['end'] = end
                         else:
-                            if start - current_music_block['end'] < 2.0:
-                                current_music_block['end'] = end
-                            else:
-                                final_music_segments.append(current_music_block)
-                                current_music_block = {'start': start, 'end': end}
-                else:
-                    if current_music_block is not None:
-                        final_music_segments.append(current_music_block)
-                        current_music_block = None
-            if current_music_block is not None:
-                final_music_segments.append(current_music_block)
+                            final_music_segments.append(current_music_block)
+                            current_music_block = {'start': start, 'end': end}
+            else:
+                if current_music_block is not None:
+                    final_music_segments.append(current_music_block)
+                    current_music_block = None
+        if current_music_block is not None:
+            final_music_segments.append(current_music_block)
         print(f"Music segmentation complete. Found {len(final_music_segments)} segments.")
+        # --- END OF FIX ---
 
         # --- Step 3: Wait for AssemblyAI and Process Results ---
         print("Waiting for AssemblyAI transcript to complete...")
