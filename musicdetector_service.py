@@ -3,8 +3,6 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
 import tempfile
-from pydub import AudioSegment
-from inaSpeechSegmenter import Segmenter
 import requests
 import uuid
 import soundfile as sf
@@ -12,68 +10,48 @@ import subprocess
 import glob
 import shutil
 import json
-from multiprocessing import Process
-import whisper
+from multiprocessing import Process, Manager
+import assemblyai as aai
 
-# This function remains the same, used for music segmentation on chunks
-def process_chunk(chunk_file_path, result_file_path):
+# --- AssemblyAI API Key ---
+# IMPORTANT: Set this as an environment variable in your deployment
+ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY")
+if not ASSEMBLYAI_API_KEY:
+    print("WARNING: ASSEMBLYAI_API_KEY environment variable not set.")
+aai.settings.api_key = ASSEMBLYAI_API_KEY
+
+# This function is for the music segmentation subprocess
+def process_music_chunk(chunk_file_path, result_list):
     try:
         from inaSpeechSegmenter import Segmenter
-        import tensorflow as tf
-        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+        from pydub import AudioSegment
         seg = Segmenter()
         audio_chunk = AudioSegment.from_file(chunk_file_path)
         processed_chunk = audio_chunk.set_frame_rate(16000).set_channels(1)
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as temp_wav:
             processed_chunk.export(temp_wav.name, format="wav")
             chunk_segmentation = seg(temp_wav.name)
-            with open(result_file_path, 'w') as f:
-                json.dump(chunk_segmentation, f)
+            result_list.extend(chunk_segmentation)
     except Exception as e:
-        print(f"[pid:{os.getpid()}] ERROR in child process: {e}")
-        with open(result_file_path, 'w') as f:
-            json.dump({"error": str(e)}, f)
+        print(f"[pid:{os.getpid()}] ERROR in music chunk process: {e}")
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}) 
 
-# --- NEW: Function to IDENTIFY (not remove) filler words ---
-def identify_filler_words(input_path, filler_words_list):
-    """
-    Transcribes audio and returns a list of identified filler words with timestamps.
-    """
-    print("Starting audio transcription with Whisper to find filler words...")
-    model = whisper.load_model("base")
-    result = model.transcribe(input_path, word_timestamps=True)
-    print("Transcription complete.")
-
-    segments = result.get("segments", [])
-    all_words = []
-    for segment in segments:
-        all_words.extend(segment.get("words", []))
-
-    filler_word_segments = []
-    for word_info in all_words:
-        word = word_info.get("word", "").strip().lower().replace('.', '').replace(',', '').replace('?', '')
-        if word in filler_words_list:
-            filler_word_segments.append({
-                "word": word,
-                "start": round(word_info["start"], 2),
-                "end": round(word_info["end"], 2)
-            })
-    
-    print(f"Identified {len(filler_word_segments)} filler word instances.")
-    return filler_word_segments
-
+def is_segment_in_music(segment_start, segment_end, music_segments):
+    """Checks if a given time range overlaps with any music segments."""
+    for music in music_segments:
+        if max(segment_start, music['start']) < min(segment_end, music['end']):
+            return True
+    return False
 
 @app.route('/segment-audio', methods=['POST'])
 def segment_audio():
-    print("--- Segment Audio Request Received ---")
+    print("--- Full Analysis Request Received ---")
     original_temp_audio_path = None
     temp_chunk_dir = None
     
     try:
-        # --- (File download logic is the same) ---
         if 'audio_file' in request.files:
             audio_file = request.files['audio_file']
             original_temp_audio_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}{os.path.splitext(audio_file.filename)[1]}")
@@ -88,17 +66,17 @@ def segment_audio():
         else:
             return jsonify({"error": "No valid audio URL or file provided"}), 400
 
-        # --- Step 1: Identify Filler Words ---
-        filler_words_to_find = [
-            'um', 'uh', 'er', 'ah', 'like', 'you know', 
-            'i mean', 'so', 'kind of', 'sort of', 'basically', 'actually'
-        ]
-        filler_word_segments = identify_filler_words(original_temp_audio_path, filler_words_to_find)
+        # --- Step 1: Start AssemblyAI Transcription (asynchronous) ---
+        print("Submitting file to AssemblyAI for transcription...")
+        config = aai.TranscriptionConfig(speaker_labels=True, disfluencies=True)
+        transcriber = aai.Transcriber()
+        transcript_future = transcriber.transcribe_async(original_temp_audio_path, config)
 
-        # --- Step 2: Identify Music Segments (on the original audio) ---
+        # --- Step 2: Perform Music Segmentation in Parallel ---
+        print("Starting music segmentation...")
         ffprobe_command = ['ffprobe', '-v', 'error', '-show_format', '-print_format', 'json', original_temp_audio_path]
-        result = subprocess.run(ffprobe_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        total_duration_seconds = float(json.loads(result.stdout)['format']['duration'])
+        ffprobe_result = subprocess.run(ffprobe_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        total_duration_seconds = float(json.loads(ffprobe_result.stdout)['format']['duration'])
         
         CHUNK_DURATION_SECONDS = 300
         temp_chunk_dir = tempfile.mkdtemp()
@@ -108,54 +86,86 @@ def segment_audio():
         subprocess.run(ffmpeg_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         
         chunk_files = sorted(glob.glob(os.path.join(temp_chunk_dir, 'chunk_*.wav')))
-        all_music_segments_raw = []
         
-        for i, chunk_file_path in enumerate(chunk_files):
-            result_file_path = os.path.join(temp_chunk_dir, f"result_{i}.json")
-            p = Process(target=process_chunk, args=(chunk_file_path, result_file_path))
-            p.start()
-            p.join()
-            with open(result_file_path, 'r') as f:
-                result_data = json.load(f)
-                if "error" in result_data: raise Exception(f"Error in chunk {i}: {result_data['error']}")
-                offset = i * CHUNK_DURATION_SECONDS
-                for label, start, end in result_data:
-                    all_music_segments_raw.append((label, start + offset, end + offset))
+        with Manager() as manager:
+            all_music_segments_raw = manager.list()
+            processes = []
+            for i, chunk_file_path in enumerate(chunk_files):
+                p = Process(target=process_music_chunk, args=(chunk_file_path, all_music_segments_raw))
+                processes.append(p)
+                p.start()
+            for p in processes:
+                p.join()
+            
+            # Merge music segments
+            final_music_segments = []
+            current_music_block = None
+            # Adjust timestamps
+            adjusted_segments = []
+            for i, (label, start, end) in enumerate(all_music_segments_raw):
+                # This logic assumes chunks are processed in order, which they are.
+                # A more robust solution might pass the chunk index 'i' back.
+                offset = (i // (len(all_music_segments_raw) / len(chunk_files))) * CHUNK_DURATION_SECONDS
+                adjusted_segments.append((label, start + offset, end + offset))
 
-        # Merge music segments
-        final_music_segments = []
-        current_music_block = None
-        for label, start, end in all_music_segments_raw:
-            if label == 'music':
-                if (end - start) >= 3:
-                    if current_music_block is None:
-                        current_music_block = {'start': start, 'end': end}
-                    else:
-                        if start - current_music_block['end'] < 2.0:
-                            current_music_block['end'] = end
-                        else:
-                            final_music_segments.append(current_music_block)
+            for label, start, end in adjusted_segments:
+                if label == 'music':
+                    if (end - start) >= 3:
+                        if current_music_block is None:
                             current_music_block = {'start': start, 'end': end}
-            else:
-                if current_music_block is not None:
-                    final_music_segments.append(current_music_block)
-                    current_music_block = None
-        if current_music_block is not None:
-            final_music_segments.append(current_music_block)
+                        else:
+                            if start - current_music_block['end'] < 2.0:
+                                current_music_block['end'] = end
+                            else:
+                                final_music_segments.append(current_music_block)
+                                current_music_block = {'start': start, 'end': end}
+                else:
+                    if current_music_block is not None:
+                        final_music_segments.append(current_music_block)
+                        current_music_block = None
+            if current_music_block is not None:
+                final_music_segments.append(current_music_block)
+        print(f"Music segmentation complete. Found {len(final_music_segments)} segments.")
 
-        print(f"Found {len(final_music_segments)} music segments and {len(filler_word_segments)} filler words.")
+        # --- Step 3: Wait for AssemblyAI and Process Results ---
+        print("Waiting for AssemblyAI transcript to complete...")
+        transcript = transcript_future.result()
+
+        if transcript.status == aai.TranscriptStatus.error:
+            raise Exception(f"AssemblyAI transcription failed: {transcript.error}")
+
+        # Process Filler Words
+        filler_word_segments = [
+            {"word": word.text, "start": round(word.start / 1000, 2), "end": round(word.end / 1000, 2)}
+            for word in transcript.words if word.word_type == aai.WordType.filler
+            if not is_segment_in_music(round(word.start / 1000, 2), round(word.end / 1000, 2), final_music_segments)
+        ]
         
-        # --- Step 3: Return Both Lists in the Response ---
+        # Process Dead Air (Silence)
+        dead_air_segments = [
+            {"start": round(gap.start / 1000, 2), "end": round(gap.end / 1000, 2), "duration": round(gap.duration / 1000, 2)}
+            for gap in transcript.speech_gaps if gap.duration >= 3000 # 3 seconds threshold
+            if not is_segment_in_music(round(gap.start / 1000, 2), round(gap.end / 1000, 2), final_music_segments)
+        ]
+
+        # Process Speaker Segments
+        speaker_segments = [
+            {"speaker": utterance.speaker, "text": utterance.text, "start": round(utterance.start / 1000, 2), "end": round(utterance.end / 1000, 2)}
+            for utterance in transcript.utterances
+            if not is_segment_in_music(round(utterance.start / 1000, 2), round(utterance.end / 1000, 2), final_music_segments)
+        ]
+
+        print("All processing complete.")
         return jsonify({
             "duration": round(total_duration_seconds, 2),
             "music_segments": final_music_segments,
-            "filler_word_segments": filler_word_segments
+            "filler_word_segments": filler_word_segments,
+            "dead_air_segments": dead_air_segments,
+            "speaker_segments": speaker_segments
         }), 200
 
     except Exception as e:
         print(f"An error occurred during segmentation: {e}")
-        if isinstance(e, subprocess.CalledProcessError):
-            return jsonify({"error": f"FFmpeg failed: {e.stderr.decode()}"}), 500
         return jsonify({"error": f"An error occurred: {e}"}), 500
     finally:
         if original_temp_audio_path and os.path.exists(original_temp_audio_path):
