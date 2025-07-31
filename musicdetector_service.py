@@ -36,31 +36,40 @@ def segment_audio():
     processed_temp_audio_path = None # For the standardized WAV file
     
     try:
-        audio_source = None
+        audio_source_for_processing = None
 
         if 'audio_file' in request.files:
             audio_file = request.files['audio_file']
             original_temp_audio_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}{os.path.splitext(audio_file.filename)[1]}")
             audio_file.save(original_temp_audio_path)
-            audio_source = original_temp_audio_path
+            audio_source_for_processing = original_temp_audio_path
         elif request.is_json and 'audio_url' in request.json:
             audio_url = request.json['audio_url']
-            audio_source = audio_url
-            print(f"Received audio URL to process: {audio_source}")
+            print(f"Received audio URL to process: {audio_url}")
+            # --- FIX: Download the remote file to a local temporary path ---
+            response = requests.get(audio_url, stream=True)
+            response.raise_for_status()
+            original_temp_audio_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.tmp")
+            with open(original_temp_audio_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            print(f"Downloaded remote file to: {original_temp_audio_path}")
+            audio_source_for_processing = original_temp_audio_path
         else:
             return jsonify({"error": "No valid audio URL or file provided"}), 400
 
         # --- Step 1: Start AssemblyAI Transcription (asynchronous) ---
+        # AssemblyAI can handle the local file path directly
         print("Submitting audio source to AssemblyAI for transcription...")
         config = aai.TranscriptionConfig(speaker_labels=True)
         transcriber = aai.Transcriber()
-        transcript_future = transcriber.transcribe_async(audio_source, config)
+        transcript_future = transcriber.transcribe_async(audio_source_for_processing, config)
 
         # --- Step 2: Perform Music Segmentation on the Full File ---
         print("Starting music segmentation on the full audio file...")
         
-        # Load the entire audio file using pydub
-        audio_segment = AudioSegment.from_file(audio_source)
+        # Load the entire audio file using pydub from the local path
+        audio_segment = AudioSegment.from_file(audio_source_for_processing)
         total_duration_seconds = len(audio_segment) / 1000.0
         
         # Standardize the entire file for the segmenter
@@ -142,7 +151,7 @@ def segment_audio():
         return jsonify({"error": f"An error occurred: {e}"}), 500
     finally:
         # Clean up all temporary files
-        if original_temp_audio_path and os.path.exists(original_temp_audio_path) and audio_source == original_temp_audio_path:
+        if original_temp_audio_path and os.path.exists(original_temp_audio_path):
             os.remove(original_temp_audio_path)
         if processed_temp_audio_path and os.path.exists(processed_temp_audio_path):
             os.remove(processed_temp_audio_path)
