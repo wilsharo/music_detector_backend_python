@@ -67,8 +67,8 @@ def segment_audio():
 
         # --- Step 1: Start AssemblyAI Transcription (asynchronous) ---
         print("Submitting audio source to AssemblyAI for transcription...")
-        # --- FIX: Enable silence detection by setting a speech threshold ---
-        config = aai.TranscriptionConfig(speaker_labels=True, speech_threshold=500) # 500ms threshold for silence
+        # --- FIX: Removed the incorrect speech_threshold parameter ---
+        config = aai.TranscriptionConfig(speaker_labels=True) # disfluencies and speech_gaps are enabled by default
         transcriber = aai.Transcriber()
         transcript_future = transcriber.transcribe_async(audio_source, config)
 
@@ -143,7 +143,7 @@ def segment_audio():
             if not is_segment_in_music(round(word.start / 1000, 2), round(word.end / 1000, 2), final_music_segments)
         ]
         
-        # --- FIX: Safely access speech_gaps attribute ---
+        # Safely access speech_gaps attribute
         speech_gaps = transcript.speech_gaps if hasattr(transcript, 'speech_gaps') else []
         dead_air_segments = [
             {"start": round(gap.start / 1000, 2), "end": round(gap.end / 1000, 2), "duration": round(gap.duration / 1000, 2)}
