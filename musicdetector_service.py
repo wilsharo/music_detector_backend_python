@@ -71,22 +71,20 @@ def segment_audio():
         
         chunk_files = sorted(glob.glob(os.path.join(temp_chunk_dir, 'chunk_*.wav')))
         
-        # --- FIX: Reverted to a reliable sequential loop ---
+        # --- FIX: Reverted to a reliable sequential loop for music segmentation ---
         all_segments_with_offsets = []
         seg_model = Segmenter() # Initialize model once
 
         for i, chunk_file_path in enumerate(chunk_files):
             print(f"Processing music chunk {i+1}/{len(chunk_files)}...")
-            # Use pydub to standardize the chunk
+            from pydub import AudioSegment
             audio_chunk = AudioSegment.from_file(chunk_file_path)
             processed_chunk = audio_chunk.set_frame_rate(16000).set_channels(1)
             
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as temp_wav:
                 processed_chunk.export(temp_wav.name, format="wav")
-                # Run segmentation on the standardized chunk
                 chunk_segmentation = seg_model(temp_wav.name)
                 
-                # Apply the offset immediately
                 offset = i * CHUNK_DURATION_SECONDS
                 for label, start, end in chunk_segmentation:
                     all_segments_with_offsets.append((label, start + offset, end + offset))
