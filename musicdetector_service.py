@@ -60,7 +60,6 @@ def segment_audio():
             audio_source = original_temp_audio_path
         elif request.is_json and 'audio_url' in request.json:
             audio_url = request.json['audio_url']
-            # --- FIX: Use the URL directly instead of downloading it first ---
             audio_source = audio_url
             print(f"Received audio URL to process: {audio_source}")
         else:
@@ -68,14 +67,13 @@ def segment_audio():
 
         # --- Step 1: Start AssemblyAI Transcription (asynchronous) ---
         print("Submitting audio source to AssemblyAI for transcription...")
-        config = aai.TranscriptionConfig(speaker_labels=True) # disfluencies is true by default
+        # --- FIX: Enable silence detection by setting a speech threshold ---
+        config = aai.TranscriptionConfig(speaker_labels=True, speech_threshold=500) # 500ms threshold for silence
         transcriber = aai.Transcriber()
-        # Pass the URL or file path directly to the SDK
         transcript_future = transcriber.transcribe_async(audio_source, config)
 
         # --- Step 2: Perform Music Segmentation in Parallel ---
         print("Starting music segmentation...")
-        # Use the same audio_source for ffprobe and ffmpeg, as they both accept URLs or file paths
         ffprobe_command = ['ffprobe', '-v', 'error', '-show_format', '-print_format', 'json', audio_source]
         ffprobe_result = subprocess.run(ffprobe_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         total_duration_seconds = float(json.loads(ffprobe_result.stdout)['format']['duration'])
@@ -104,6 +102,8 @@ def segment_audio():
             
             # This logic assumes chunks are processed in order.
             for i, (label, start, end) in enumerate(list(all_music_segments_raw)):
+                # A more robust offset calculation is needed if multiprocessing order is not guaranteed.
+                # This simple approach works for sequential processing of chunks.
                 offset = (i // (len(all_music_segments_raw) / len(chunk_files))) * CHUNK_DURATION_SECONDS
                 if label == 'music':
                     start, end = start + offset, end + offset
@@ -143,9 +143,11 @@ def segment_audio():
             if not is_segment_in_music(round(word.start / 1000, 2), round(word.end / 1000, 2), final_music_segments)
         ]
         
+        # --- FIX: Safely access speech_gaps attribute ---
+        speech_gaps = transcript.speech_gaps if hasattr(transcript, 'speech_gaps') else []
         dead_air_segments = [
             {"start": round(gap.start / 1000, 2), "end": round(gap.end / 1000, 2), "duration": round(gap.duration / 1000, 2)}
-            for gap in transcript.speech_gaps if gap.duration >= 3000
+            for gap in speech_gaps if gap.duration >= 3000
             if not is_segment_in_music(round(gap.start / 1000, 2), round(gap.end / 1000, 2), final_music_segments)
         ]
 
