@@ -51,29 +51,32 @@ def segment_audio():
     temp_chunk_dir = None
     
     try:
+        audio_source = None # This will hold either a URL or a local file path
+
         if 'audio_file' in request.files:
             audio_file = request.files['audio_file']
             original_temp_audio_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}{os.path.splitext(audio_file.filename)[1]}")
             audio_file.save(original_temp_audio_path)
+            audio_source = original_temp_audio_path
         elif request.is_json and 'audio_url' in request.json:
             audio_url = request.json['audio_url']
-            response = requests.get(audio_url, stream=True)
-            response.raise_for_status()
-            original_temp_audio_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.tmp")
-            with open(original_temp_audio_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192): f.write(chunk)
+            # --- FIX: Use the URL directly instead of downloading it first ---
+            audio_source = audio_url
+            print(f"Received audio URL to process: {audio_source}")
         else:
             return jsonify({"error": "No valid audio URL or file provided"}), 400
 
         # --- Step 1: Start AssemblyAI Transcription (asynchronous) ---
-        print("Submitting file to AssemblyAI for transcription...")
+        print("Submitting audio source to AssemblyAI for transcription...")
         config = aai.TranscriptionConfig(speaker_labels=True) # disfluencies is true by default
         transcriber = aai.Transcriber()
-        transcript_future = transcriber.transcribe_async(original_temp_audio_path, config)
+        # Pass the URL or file path directly to the SDK
+        transcript_future = transcriber.transcribe_async(audio_source, config)
 
         # --- Step 2: Perform Music Segmentation in Parallel ---
         print("Starting music segmentation...")
-        ffprobe_command = ['ffprobe', '-v', 'error', '-show_format', '-print_format', 'json', original_temp_audio_path]
+        # Use the same audio_source for ffprobe and ffmpeg, as they both accept URLs or file paths
+        ffprobe_command = ['ffprobe', '-v', 'error', '-show_format', '-print_format', 'json', audio_source]
         ffprobe_result = subprocess.run(ffprobe_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         total_duration_seconds = float(json.loads(ffprobe_result.stdout)['format']['duration'])
         
@@ -81,7 +84,7 @@ def segment_audio():
         temp_chunk_dir = tempfile.mkdtemp()
         output_template = os.path.join(temp_chunk_dir, 'chunk_%03d.wav')
         
-        ffmpeg_command = ['ffmpeg', '-i', original_temp_audio_path, '-f', 'segment', '-segment_time', str(CHUNK_DURATION_SECONDS), '-c:a', 'pcm_s16le', output_template]
+        ffmpeg_command = ['ffmpeg', '-i', audio_source, '-f', 'segment', '-segment_time', str(CHUNK_DURATION_SECONDS), '-c:a', 'pcm_s16le', output_template]
         subprocess.run(ffmpeg_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         
         chunk_files = sorted(glob.glob(os.path.join(temp_chunk_dir, 'chunk_*.wav')))
@@ -100,8 +103,6 @@ def segment_audio():
             current_music_block = None
             
             # This logic assumes chunks are processed in order.
-            # A more robust way is to sort by a naming convention if parallel processing order isn't guaranteed.
-            # For now, this should work as glob provides a sorted list.
             for i, (label, start, end) in enumerate(list(all_music_segments_raw)):
                 offset = (i // (len(all_music_segments_raw) / len(chunk_files))) * CHUNK_DURATION_SECONDS
                 if label == 'music':
@@ -130,7 +131,6 @@ def segment_audio():
         if transcript.status == aai.TranscriptStatus.error:
             raise Exception(f"AssemblyAI transcription failed: {transcript.error}")
 
-        # --- FIX: Corrected filler word identification logic ---
         filler_words_to_find = [
             'um', 'uh', 'er', 'ah', 'like', 'you know', 
             'i mean', 'so', 'kind of', 'sort of', 'basically', 'actually'
@@ -143,14 +143,12 @@ def segment_audio():
             if not is_segment_in_music(round(word.start / 1000, 2), round(word.end / 1000, 2), final_music_segments)
         ]
         
-        # Process Dead Air (Silence)
         dead_air_segments = [
             {"start": round(gap.start / 1000, 2), "end": round(gap.end / 1000, 2), "duration": round(gap.duration / 1000, 2)}
             for gap in transcript.speech_gaps if gap.duration >= 3000
             if not is_segment_in_music(round(gap.start / 1000, 2), round(gap.end / 1000, 2), final_music_segments)
         ]
 
-        # Process Speaker Segments
         speaker_segments = [
             {"speaker": utterance.speaker, "text": utterance.text, "start": round(utterance.start / 1000, 2), "end": round(utterance.end / 1000, 2)}
             for utterance in transcript.utterances
@@ -170,6 +168,7 @@ def segment_audio():
         print(f"An error occurred during segmentation: {e}")
         return jsonify({"error": f"An error occurred: {e}"}), 500
     finally:
+        # Only clean up the original temp path if it was created (from a file upload)
         if original_temp_audio_path and os.path.exists(original_temp_audio_path):
             os.remove(original_temp_audio_path)
         if temp_chunk_dir and os.path.exists(temp_chunk_dir):
