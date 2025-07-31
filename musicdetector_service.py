@@ -7,7 +7,6 @@ import requests
 import uuid
 import soundfile as sf
 import subprocess
-import glob
 import shutil
 import json
 from inaSpeechSegmenter import Segmenter
@@ -32,9 +31,9 @@ def is_segment_in_music(segment_start, segment_end, music_segments):
 
 @app.route('/segment-audio', methods=['POST'])
 def segment_audio():
-    print("--- Full Analysis Request Received ---")
+    print("--- Full Analysis Request Received (Single-Pass Mode) ---")
     original_temp_audio_path = None
-    temp_chunk_dir = None
+    processed_temp_audio_path = None # For the standardized WAV file
     
     try:
         audio_source = None
@@ -57,42 +56,28 @@ def segment_audio():
         transcriber = aai.Transcriber()
         transcript_future = transcriber.transcribe_async(audio_source, config)
 
-        # --- Step 2: Perform Music Segmentation Sequentially for Accuracy ---
-        print("Starting music segmentation...")
-        ffprobe_command = ['ffprobe', '-v', 'error', '-show_format', '-print_format', 'json', audio_source]
-        ffprobe_result = subprocess.run(ffprobe_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        total_duration_seconds = float(json.loads(ffprobe_result.stdout)['format']['duration'])
+        # --- Step 2: Perform Music Segmentation on the Full File ---
+        print("Starting music segmentation on the full audio file...")
         
-        CHUNK_DURATION_SECONDS = 300
-        temp_chunk_dir = tempfile.mkdtemp()
-        output_template = os.path.join(temp_chunk_dir, 'chunk_%03d.wav')
+        # Load the entire audio file using pydub
+        audio_segment = AudioSegment.from_file(audio_source)
+        total_duration_seconds = len(audio_segment) / 1000.0
         
-        ffmpeg_command = ['ffmpeg', '-i', audio_source, '-f', 'segment', '-segment_time', str(CHUNK_DURATION_SECONDS), '-c:a', 'pcm_s16le', output_template]
-        subprocess.run(ffmpeg_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # Standardize the entire file for the segmenter
+        processed_audio_segment = audio_segment.set_frame_rate(16000).set_channels(1).set_sample_width(2)
         
-        chunk_files = sorted(glob.glob(os.path.join(temp_chunk_dir, 'chunk_*.wav')))
+        # Export the full standardized file to a temporary WAV
+        processed_temp_audio_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.wav")
+        processed_audio_segment.export(processed_temp_audio_path, format="wav")
         
-        # --- FIX: Reverted to a reliable sequential loop for music segmentation ---
-        all_segments_with_offsets = []
-        seg_model = Segmenter() # Initialize model once
+        # Run the segmenter once on the complete, standardized file
+        seg_model = Segmenter()
+        segmentation_results = seg_model(processed_temp_audio_path)
 
-        for i, chunk_file_path in enumerate(chunk_files):
-            print(f"Processing music chunk {i+1}/{len(chunk_files)}...")
-            audio_chunk = AudioSegment.from_file(chunk_file_path)
-            processed_chunk = audio_chunk.set_frame_rate(16000).set_channels(1)
-            
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as temp_wav:
-                processed_chunk.export(temp_wav.name, format="wav")
-                chunk_segmentation = seg_model(temp_wav.name)
-                
-                offset = i * CHUNK_DURATION_SECONDS
-                for label, start, end in chunk_segmentation:
-                    all_segments_with_offsets.append((label, start + offset, end + offset))
-
-        # Merge the results after all chunks are processed
+        # Merge the results
         final_music_segments = []
         current_music_block = None
-        for label, start, end in all_segments_with_offsets:
+        for label, start, end in segmentation_results:
             if label == 'music':
                 if (end - start) >= 3:
                     if current_music_block is None:
@@ -110,7 +95,6 @@ def segment_audio():
         if current_music_block is not None:
             final_music_segments.append(current_music_block)
         print(f"Music segmentation complete. Found {len(final_music_segments)} segments.")
-        # --- END OF FIX ---
 
         # --- Step 3: Wait for AssemblyAI and Process Results ---
         print("Waiting for AssemblyAI transcript to complete...")
@@ -157,10 +141,11 @@ def segment_audio():
         print(f"An error occurred during segmentation: {e}")
         return jsonify({"error": f"An error occurred: {e}"}), 500
     finally:
-        if original_temp_audio_path and os.path.exists(original_temp_audio_path):
+        # Clean up all temporary files
+        if original_temp_audio_path and os.path.exists(original_temp_audio_path) and audio_source == original_temp_audio_path:
             os.remove(original_temp_audio_path)
-        if temp_chunk_dir and os.path.exists(temp_chunk_dir):
-            shutil.rmtree(temp_chunk_dir)
+        if processed_temp_audio_path and os.path.exists(processed_temp_audio_path):
+            os.remove(processed_temp_audio_path)
 
 if __name__ == '__main__':
     app.run(debug=False, host='0.0.0.0', port=5002, use_reloader=False)
