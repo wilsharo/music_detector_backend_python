@@ -14,7 +14,6 @@ from multiprocessing import Process, Manager
 import assemblyai as aai
 
 # --- AssemblyAI API Key ---
-# IMPORTANT: Set this as an environment variable in your deployment
 ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY")
 if not ASSEMBLYAI_API_KEY:
     print("WARNING: ASSEMBLYAI_API_KEY environment variable not set.")
@@ -68,7 +67,7 @@ def segment_audio():
 
         # --- Step 1: Start AssemblyAI Transcription (asynchronous) ---
         print("Submitting file to AssemblyAI for transcription...")
-        config = aai.TranscriptionConfig(speaker_labels=True, disfluencies=True)
+        config = aai.TranscriptionConfig(speaker_labels=True) # disfluencies is true by default
         transcriber = aai.Transcriber()
         transcript_future = transcriber.transcribe_async(original_temp_audio_path, config)
 
@@ -97,19 +96,16 @@ def segment_audio():
             for p in processes:
                 p.join()
             
-            # Merge music segments
             final_music_segments = []
             current_music_block = None
-            # Adjust timestamps
-            adjusted_segments = []
-            for i, (label, start, end) in enumerate(all_music_segments_raw):
-                # This logic assumes chunks are processed in order, which they are.
-                # A more robust solution might pass the chunk index 'i' back.
+            
+            # This logic assumes chunks are processed in order.
+            # A more robust way is to sort by a naming convention if parallel processing order isn't guaranteed.
+            # For now, this should work as glob provides a sorted list.
+            for i, (label, start, end) in enumerate(list(all_music_segments_raw)):
                 offset = (i // (len(all_music_segments_raw) / len(chunk_files))) * CHUNK_DURATION_SECONDS
-                adjusted_segments.append((label, start + offset, end + offset))
-
-            for label, start, end in adjusted_segments:
                 if label == 'music':
+                    start, end = start + offset, end + offset
                     if (end - start) >= 3:
                         if current_music_block is None:
                             current_music_block = {'start': start, 'end': end}
@@ -134,17 +130,23 @@ def segment_audio():
         if transcript.status == aai.TranscriptStatus.error:
             raise Exception(f"AssemblyAI transcription failed: {transcript.error}")
 
-        # Process Filler Words
+        # --- FIX: Corrected filler word identification logic ---
+        filler_words_to_find = [
+            'um', 'uh', 'er', 'ah', 'like', 'you know', 
+            'i mean', 'so', 'kind of', 'sort of', 'basically', 'actually'
+        ]
+        
         filler_word_segments = [
             {"word": word.text, "start": round(word.start / 1000, 2), "end": round(word.end / 1000, 2)}
-            for word in transcript.words if word.word_type == aai.WordType.filler
+            for word in transcript.words
+            if word.text.lower().strip(".,?!") in filler_words_to_find
             if not is_segment_in_music(round(word.start / 1000, 2), round(word.end / 1000, 2), final_music_segments)
         ]
         
         # Process Dead Air (Silence)
         dead_air_segments = [
             {"start": round(gap.start / 1000, 2), "end": round(gap.end / 1000, 2), "duration": round(gap.duration / 1000, 2)}
-            for gap in transcript.speech_gaps if gap.duration >= 3000 # 3 seconds threshold
+            for gap in transcript.speech_gaps if gap.duration >= 3000
             if not is_segment_in_music(round(gap.start / 1000, 2), round(gap.end / 1000, 2), final_music_segments)
         ]
 
