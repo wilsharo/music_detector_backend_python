@@ -79,23 +79,35 @@ def segment_audio():
 
         final_music_segments = []
         current_music_block = None
-        for label, start, end in segmentation_results:
+        final_speaking_segments = []
+        LONG_SPEECH_THRESHOLD_SECONDS = 120
+        i = 0
+        while i < len(segmentation_results):
+            label, start, end = segmentation_results[i]
             if label == 'music':
-                if (end - start) >= 3:
-                    if current_music_block is None:
+                if current_music_block is None:
+                    if (end - start) >= 3:
                         current_music_block = {'start': start, 'end': end}
-                    else:
-                        if start - current_music_block['end'] < 2.0:
-                            current_music_block['end'] = end
-                        else:
-                            final_music_segments.append(current_music_block)
-                            current_music_block = {'start': start, 'end': end}
-            else:
-                if current_music_block is not None:
-                    final_music_segments.append(current_music_block)
-                    current_music_block = None
+                else:
+                    current_music_block['end'] = end
+            
+            if label in ['male', 'female']:
+                speech_duration = end - start
+                if speech_duration >= LONG_SPEECH_THRESHOLD_SECONDS:
+                    if current_music_block is not None:
+                        final_music_segments.append(
+                            {'start': round(current_music_block['start'], 2), 'end': round(current_music_block['end'], 2)}
+                        )
+                        current_music_block = None
+                    final_speaking_segments.append(
+                            {'label': label, 'start': round(start, 2), 'end': round(end, 2)}
+                        )
+            i += 1
+            
         if current_music_block is not None:
-            final_music_segments.append(current_music_block)
+            final_music_segments.append(
+                {'start': round(current_music_block['start'], 2), 'end': round(current_music_block['end'], 2)}
+            )
         print(f"Music segmentation complete. Found {len(final_music_segments)} segments.")
 
         # --- Step 3: Wait for AssemblyAI and Process Results ---
@@ -190,7 +202,6 @@ def render_audio():
         subprocess.run(ffmpeg_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         print(f"Exported audio saved to: {output_path}")
 
-        # Return the generated file
         return send_file(
             output_path,
             as_attachment=True,
@@ -204,7 +215,6 @@ def render_audio():
             print("FFMPEG STDERR:", e.stderr.decode())
         return jsonify({"error": f"An error occurred during rendering: {e}"}), 500
     finally:
-        # Clean up the temporary directory
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
 
