@@ -12,6 +12,7 @@ import json
 from inaSpeechSegmenter import Segmenter
 from pydub import AudioSegment
 import assemblyai as aai
+import numpy as np
 
 # --- AssemblyAI API Key ---
 ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY")
@@ -21,6 +22,38 @@ aai.settings.api_key = ASSEMBLYAI_API_KEY
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}) 
+
+# --- NEW: Function to generate waveform peak data ---
+def generate_peak_data(audio_path, points=1000):
+    """
+    Generates a simplified array of peak data for rendering a waveform.
+    """
+    print("Generating peak data for waveform...")
+    try:
+        audio = AudioSegment.from_file(audio_path)
+        samples = np.array(audio.get_array_of_samples())
+        
+        # If stereo, convert to mono by averaging channels
+        if audio.channels == 2:
+            samples = samples.reshape((-1, 2)).mean(axis=1)
+
+        # Normalize to -1.0 to 1.0
+        samples = samples / (2**15)
+
+        chunk_size = len(samples) // points
+        peaks = []
+        for i in range(points):
+            chunk = samples[i * chunk_size : (i + 1) * chunk_size]
+            if len(chunk) > 0:
+                peak = float(np.max(np.abs(chunk)))
+                peaks.append(round(peak, 4))
+        
+        print(f"Peak data generated with {len(peaks)} points.")
+        return peaks
+    except Exception as e:
+        print(f"Could not generate peak data: {e}")
+        return None
+
 
 def is_segment_in_music(segment_start, segment_end, music_segments):
     """Checks if a given time range overlaps with any music segments."""
@@ -33,7 +66,7 @@ def is_segment_in_music(segment_start, segment_end, music_segments):
 def segment_audio():
     print("--- Full Analysis Request Received (Single-Pass Mode) ---")
     original_temp_audio_path = None
-    processed_temp_audio_path = None # For the standardized WAV file
+    processed_temp_audio_path = None
     
     try:
         audio_source_for_processing = None
@@ -142,20 +175,24 @@ def segment_audio():
             if not is_segment_in_music(round(utterance.start / 1000, 2), round(utterance.end / 1000, 2), final_music_segments)
         ]
 
+        # --- Step 4: Generate Peak Data ---
+        peak_data = generate_peak_data(processed_temp_audio_path)
+
         print("All processing complete.")
         return jsonify({
             "duration": round(total_duration_seconds, 2),
             "music_segments": final_music_segments,
             "filler_word_segments": filler_word_segments,
             "dead_air_segments": dead_air_segments,
-            "speaker_segments": speaker_segments
+            "speaker_segments": speaker_segments,
+            "peak_data": peak_data # Add peak data to the response
         }), 200
 
     except Exception as e:
         print(f"An error occurred during segmentation: {e}")
         return jsonify({"error": f"An error occurred: {e}"}), 500
     finally:
-        if original_temp_audio_path and os.path.exists(original_temp_audio_path) and audio_source_for_processing == original_temp_audio_path:
+        if original_temp_audio_path and os.path.exists(original_temp_audio_path):
             os.remove(original_temp_audio_path)
         if processed_temp_audio_path and os.path.exists(processed_temp_audio_path):
             os.remove(processed_temp_audio_path)
@@ -202,6 +239,7 @@ def render_audio():
         subprocess.run(ffmpeg_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         print(f"Exported audio saved to: {output_path}")
 
+        # Return the generated file
         return send_file(
             output_path,
             as_attachment=True,
@@ -215,6 +253,7 @@ def render_audio():
             print("FFMPEG STDERR:", e.stderr.decode())
         return jsonify({"error": f"An error occurred during rendering: {e}"}), 500
     finally:
+        # Clean up the temporary directory
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
 
