@@ -165,7 +165,7 @@ def segment_audio():
         speech_gaps = transcript.speech_gaps if hasattr(transcript, 'speech_gaps') else []
         dead_air_segments = [
             {"start": round(gap.start / 1000, 2), "end": round(gap.end / 1000, 2), "duration": round(gap.duration / 1000, 2)}
-            for gap in speech_gaps if gap.duration >= 3000
+            for gap in speech_gaps if gap.duration >= 1000
             if not is_segment_in_music(round(gap.start / 1000, 2), round(gap.end / 1000, 2), final_music_segments)
         ]
 
