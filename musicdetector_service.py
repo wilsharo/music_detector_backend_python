@@ -45,16 +45,29 @@ def generate_peak_data(audio_path, points=1000):
         return None
 
 def is_segment_in_music(segment_start, segment_end, music_segments):
-    """Checks if a given time range overlaps with any music segments."""
+    """
+    Checks if a segment is buried in music.
+    Returns True only if > 50% of the segment is covered by music.
+    """
+    segment_duration = segment_end - segment_start
+    if segment_duration <= 0:
+        return False
+
     for music in music_segments:
-        # Check for any overlap between segments
-        if max(segment_start, music['start']) < min(segment_end, music['end']):
-            return True
+        # Calculate intersection
+        overlap_start = max(segment_start, music['start'])
+        overlap_end = min(segment_end, music['end'])
+        
+        if overlap_start < overlap_end:
+            overlap_duration = overlap_end - overlap_start
+            # If the speaker is mostly covered by music, filter it out
+            if (overlap_duration / segment_duration) > 0.5:
+                return True
     return False
 
 @app.route('/segment-audio', methods=['POST'])
 def segment_audio():
-    print("--- Full Analysis Request Received ---")
+    print("--- Starting Single-Pass Analysis ---")
     original_temp_audio_path = None
     processed_temp_audio_path = None
     
@@ -76,21 +89,22 @@ def segment_audio():
                     f.write(chunk)
             audio_source_for_processing = original_temp_audio_path
         else:
-            return jsonify({"error": "No valid audio URL or file provided"}), 400
+            return jsonify({"error": "No valid audio provided"}), 400
 
-        # --- Step 1: Start AssemblyAI Transcription (FIX: Added disfluencies) ---
+        # --- Step 1: AssemblyAI (REQUEST DISFLUENCIES) ---
         print("Submitting to AssemblyAI...")
         config = aai.TranscriptionConfig(
             speaker_labels=True, 
-            disfluencies=True  # Crucial for filler words!
+            disfluencies=True 
         )
         transcriber = aai.Transcriber()
         transcript_future = transcriber.transcribe_async(audio_source_for_processing, config)
 
-        # --- Step 2: Independent Music Segmentation ---
+        # --- Step 2: Music Segmentation ---
         audio_segment = AudioSegment.from_file(audio_source_for_processing)
         total_duration_seconds = len(audio_segment) / 1000.0
         
+        # Standardize audio for inaSpeechSegmenter
         processed_audio_segment = audio_segment.set_frame_rate(16000).set_channels(1).set_sample_width(2)
         processed_temp_audio_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.wav")
         processed_audio_segment.export(processed_temp_audio_path, format="wav")
@@ -100,30 +114,21 @@ def segment_audio():
 
         final_music_segments = []
         for label, start, end in segmentation_results:
-            # We treat any music segment >= 2s as valid music
             if label == 'music' and (end - start) >= 2.0:
-                final_music_segments.append({
-                    'start': round(start, 2), 
-                    'end': round(end, 2)
-                })
+                final_music_segments.append({'start': round(start, 2), 'end': round(end, 2)})
         
-        print(f"Found {len(final_music_segments)} music segments.")
+        print(f"Music Detection: {len(final_music_segments)} segments found.")
 
-        # --- Step 3: Wait for AssemblyAI ---
+        # --- Step 3: Processing AI Results ---
         transcript = transcript_future.result()
         if transcript.status == aai.TranscriptStatus.error:
-            raise Exception(f"AssemblyAI failed: {transcript.error}")
+            raise Exception(f"AI Transcription Error: {transcript.error}")
 
-        # Filter Logic for Filler Words
-        filler_targets = ['um', 'uh', 'er', 'ah', 'like', 'basically', 'actually']
-        filler_word_segments = [
-            {"word": w.text, "start": round(w.start / 1000, 2), "end": round(w.end / 1000, 2)}
-            for w in transcript.words
-            if w.text.lower().strip(".,?!") in filler_targets
-            and not is_segment_in_music(w.start/1000, w.end/1000, final_music_segments)
-        ]
+        # Ensure we have data to iterate over
+        all_utterances = transcript.utterances if transcript.utterances is not None else []
+        all_words = transcript.words if transcript.words is not None else []
 
-        # Speaker Segments
+        # Speaker Segments (With Overlap Protection)
         speaker_segments = [
             {
                 "speaker": u.speaker, 
@@ -131,29 +136,38 @@ def segment_audio():
                 "start": round(u.start / 1000, 2), 
                 "end": round(u.end / 1000, 2)
             }
-            for u in (transcript.utterances or [])
+            for u in all_utterances
             if not is_segment_in_music(u.start/1000, u.end/1000, final_music_segments)
         ]
 
-        # Calculate Dead Air (Gaps between utterances)
-        dead_air_segments = []
-        if transcript.utterances:
-            last_end = 0
-            for u in transcript.utterances:
-                start_sec = u.start / 1000
-                if (start_sec - last_end) >= 2.0: # 2+ seconds of silence
-                    # Only add if this gap isn't actually just music
-                    if not is_segment_in_music(last_end, start_sec, final_music_segments):
-                        dead_air_segments.append({
-                            "start": round(last_end, 2),
-                            "end": round(start_sec, 2),
-                            "duration": round(start_sec - last_end, 2)
-                        })
-                last_end = u.end / 1000
+        # Filler Words
+        filler_targets = ['um', 'uh', 'er', 'ah', 'like', 'basically', 'actually']
+        filler_word_segments = [
+            {"word": w.text, "start": round(w.start / 1000, 2), "end": round(w.end / 1000, 2)}
+            for w in all_words
+            if w.text.lower().strip(".,?!") in filler_targets
+            and not is_segment_in_music(w.start/1000, w.end/1000, final_music_segments)
+        ]
 
-        # --- Step 4: Final Response ---
+        # Dead Air Calculation
+        dead_air_segments = []
+        last_end = 0
+        for u in all_utterances:
+            start_sec = u.start / 1000
+            if (start_sec - last_end) >= 2.0:
+                # Only mark as dead air if it's not a music block
+                if not is_segment_in_music(last_end, start_sec, final_music_segments):
+                    dead_air_segments.append({
+                        "start": round(last_end, 2),
+                        "end": round(start_sec, 2),
+                        "duration": round(start_sec - last_end, 2)
+                    })
+            last_end = u.end / 1000
+
+        # --- Step 4: Final Payload ---
         peak_data = generate_peak_data(processed_temp_audio_path)
 
+        print(f"Done. Returning {len(speaker_segments)} speaker segments.")
         return jsonify({
             "duration": round(total_duration_seconds, 2),
             "music_segments": final_music_segments,
@@ -164,13 +178,49 @@ def segment_audio():
         }), 200
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"FAILED: {str(e)}")
         return jsonify({"error": str(e)}), 500
     finally:
         for p in [original_temp_audio_path, processed_temp_audio_path]:
             if p and os.path.exists(p): os.remove(p)
 
-# ... (render_audio remains the same)
+@app.route('/render-audio', methods=['POST'])
+def render_audio():
+    print("--- Render Audio Request Received ---")
+    data = request.get_json()
+    audio_source = data.get('audio_url')
+    playback_sequence = data.get('playback_sequence')
+
+    if not audio_source or not playback_sequence:
+        return jsonify({"error": "Missing parameters"}), 400
+
+    temp_dir = tempfile.mkdtemp()
+    output_path = os.path.join(temp_dir, f"exported_{uuid.uuid4()}.mp3")
+
+    try:
+        filter_complex_parts = []
+        input_mappings = []
+        for i, clip in enumerate(playback_sequence):
+            start = clip['sourceStart']
+            end = clip['sourceEnd']
+            filter_complex_parts.append(f"[0:a]atrim={start}:{end},asetpts=PTS-STARTPTS[a{i}]")
+            input_mappings.append(f"[a{i}]")
+
+        concat_filter = "".join(input_mappings) + f"concat=n={len(playback_sequence)}:v=0:a=1[outa]"
+        filter_graph = ";".join(filter_complex_parts) + ";" + concat_filter
+
+        ffmpeg_command = [
+            'ffmpeg', '-i', audio_source, '-filter_complex', filter_graph,
+            '-map', '[outa]', output_path
+        ]
+
+        subprocess.run(ffmpeg_command, check=True)
+        return send_file(output_path, as_attachment=True, mimetype='audio/mpeg')
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        if temp_dir and os.path.exists(temp_dir): shutil.rmtree(temp_dir)
 
 if __name__ == '__main__':
     app.run(debug=False, host='0.0.0.0', port=5002, use_reloader=False)
